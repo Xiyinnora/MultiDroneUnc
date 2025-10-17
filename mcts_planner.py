@@ -2,53 +2,43 @@ import time
 import numpy as np
 import math
 from collections import deque
-import heapq
 
 
 class MCTSNode:
-    """MCTS树中的一个节点。"""
-
     def __init__(self, state, parent=None, action=None):
-        self.state = state
-        self.parent = parent
-        self.action = action
-        self.children = []
-        self.untried_actions = None
-        self.visits = 0
-        self.total_reward = 0.0
+        self.state, self.parent, self.action, self.children, self.untried_actions, self.visits, self.total_reward = state, parent, action, [], None, 0, 0.0
 
-    def is_fully_expanded(self):
-        return len(self.untried_actions) == 0
+    def is_fully_expanded(self): return len(self.untried_actions) == 0 if self.untried_actions is not None else True
 
     @property
-    def q_value(self):
-        if self.visits == 0:
-            return 0
-        return self.total_reward / self.visits
+    def q_value(self): return self.total_reward / self.visits if self.visits > 0 else 0
 
 
 class MCTSPlanner:
     """
-    V7.0版本：使用基于“A*路径规划”的全新前瞻性启发式。
+    V14.0 最终版：使用“风险感知”启发式，将风险评估内置于Rollout中。
     """
 
-    def __init__(self, env, exploration_constant: float = 2.0):
+    def __init__(self, env, exploration_constant: float = 2.5, rollout_depth: int = 20,
+                 risk_aversion_weight: float = 0.5):
         self._env = env
         self.exploration_constant = exploration_constant
+        self.rollout_depth = rollout_depth
+        self.risk_aversion = risk_aversion_weight
+
         self.num_drones = self._env.N
         self.single_drone_actions = self._env._action_vectors
         self.grid_size = self._env.get_config().grid_size
         self.goal_positions = self._env.get_config().goal_positions
 
-        print("V7.0 Planner: 正在为每个目标点预计算导航地图 (BFS for A* heuristic)...")
-        self.goal_distance_maps = [self._calculate_goal_distance_map(goal) for goal in self.goal_positions]
-        print("导航地图计算完成。")
+        print("V14.0 MCTS Planner: 正在预计算导航和风险地图...")
+        self.distance_field = self._env.dist_field  # 直接从环境中获取静态风险地图
+        self.goal_distance_maps = [self._calculate_goal_distance_map(g) for g in self.goal_positions]
+        print("地图计算完成。")
 
     def _calculate_goal_distance_map(self, goal_pos):
-        # ... (This BFS function is now used as the perfect heuristic for A*)
-        obstacles = self._env.obstacles
-        dist_map = np.full(self.grid_size, float('inf'))
-        q = deque([tuple(goal_pos)])
+        obstacles, dist_map = self._env.obstacles, np.full(self.grid_size, float('inf'))
+        q = deque([tuple(goal_pos)]);
         dist_map[tuple(goal_pos)] = 0
         while q:
             pos = q.popleft()
@@ -58,16 +48,13 @@ class MCTSPlanner:
                     2] < self.grid_size[2]): continue
                 if obstacles[next_pos]: continue
                 if dist_map[next_pos] == float('inf'):
-                    dist_map[next_pos] = dist_map[tuple(pos)] + 1
+                    dist_map[next_pos] = dist_map[tuple(pos)] + 1;
                     q.append(next_pos)
         return dist_map
 
     def plan(self, current_state, planning_time_per_step):
-        # ... (The main MCTS loop remains the same)
-        start_time = time.time()
-        root_node = MCTSNode(state=current_state)
+        start_time, root_node = time.time(), MCTSNode(state=current_state)
         root_node.untried_actions = list(range(self._env.num_actions))
-        num_simulations = 0
         while time.time() - start_time < planning_time_per_step:
             node = root_node
             while node.is_fully_expanded() and node.children: node = self._select_child(node)
@@ -76,22 +63,18 @@ class MCTSPlanner:
                 node.untried_actions.remove(action)
                 next_state, _, _, _ = self._env.simulate(node.state, action)
                 child_node = MCTSNode(state=next_state, parent=node, action=action)
-                child_node.untried_actions = list(range(self._env.num_actions))
-                node.children.append(child_node)
+                child_node.untried_actions = list(range(self._env.num_actions));
+                node.children.append(child_node);
                 node = child_node
-            reward = self._a_star_rollout(node.state)
+            reward = self._fast_heuristic_rollout(node.state)
             while node is not None:
-                node.visits += 1
-                node.total_reward += reward
+                node.visits += 1;
+                node.total_reward += reward;
                 node = node.parent
-            num_simulations += 1
-        print(f"在 {time.time() - start_time:.2f}s 内运行了 {num_simulations} 次模拟。")
         if not root_node.children: return np.random.randint(self._env.num_actions)
-        best_child = max(root_node.children, key=lambda c: c.visits)
-        return best_child.action
+        return max(root_node.children, key=lambda c: c.visits).action
 
     def _select_child(self, node: MCTSNode) -> MCTSNode:
-        # ... (Unchanged)
         log_total_visits = math.log(node.visits)
 
         def ucb1(child: MCTSNode):
@@ -100,87 +83,63 @@ class MCTSPlanner:
 
         return max(node.children, key=ucb1)
 
-    def _a_star_rollout(self, state: np.ndarray) -> float:
-        """
-        ★★ 核心 V7.0 启发式函数 ★★
-        使用带冲突解决的优先A*算法来评估状态的好坏。
-        """
-        paths = []
-        max_path_len = 0
+    def _get_risk_aware_greedy_action(self, state: np.ndarray) -> int:
+        current_positions, active_drones_mask = state[:, :3], state[:, 3] == 0
+        best_individual_actions = np.zeros(self.num_drones, dtype=np.int32)
+        intended_next_positions = [None] * self.num_drones
 
         for i in range(self.num_drones):
-            # 如果无人机已到达，它的路径就是停在原地
-            if state[i, 3] == 1:
-                paths.append([tuple(state[i, :3])])
+            if not active_drones_mask[i]:
+                best_individual_actions[i], intended_next_positions[i] = 0, current_positions[i]
                 continue
 
-            # 为当前无人机规划路径，将已规划好的其他无人机路径视为动态障碍物
-            path = self._a_star_search(tuple(state[i, :3]), tuple(self.goal_positions[i]), self.goal_distance_maps[i],
-                                       paths)
+            min_score, best_move_idx = float('inf'), 0
 
-            if path is None:
-                # 如果任何一架无人机找不到路径，则这是一个死局，返回极低的奖励
-                return -1000
+            for move_idx, move_vec in enumerate(self.single_drone_actions):
+                intended_pos_np = current_positions[i] + move_vec
 
-            paths.append(path)
-            max_path_len = max(max_path_len, len(path))
+                if not (0 <= intended_pos_np[0] < self.grid_size[0] and 0 <= intended_pos_np[1] < self.grid_size[
+                    1] and 0 <= intended_pos_np[2] < self.grid_size[2]):
+                    score = float('inf')
+                else:
+                    intended_pos_tuple = tuple(intended_pos_np)
+                    bfs_dist = self.goal_distance_maps[i][intended_pos_tuple]
 
-        # 根据找到的路径长度给出一个高质量的奖励评估
-        # 路径越长，奖励越低。成功找到路径本身就是一个巨大的奖励。
-        # 这里的100和-1是估算值，可以调整
-        estimated_reward = 100 - 1 * max_path_len
-        return estimated_reward
+                    # 1. 静态风险：离墙越近，风险越高
+                    static_risk = 0
+                    dist_to_obstacle = self.distance_field[intended_pos_tuple]
+                    if dist_to_obstacle < 1e-6:
+                        static_risk = float('inf')
+                    else:
+                        static_risk = self.risk_aversion / dist_to_obstacle
 
-    def _a_star_search(self, start, goal, heuristic_map, other_paths):
-        """
-        带动态障碍物躲避的A*搜索算法。
-        """
-        open_set = [(0, start)]  # (f_score, position)
-        came_from = {}
-        g_score = {start: 0}
+                    # 2. 动态风险：离队友越近，风险越高
+                    dynamic_risk = 0
+                    for j in range(i):
+                        dist_to_teammate = np.linalg.norm(intended_pos_np - intended_next_positions[j])
+                        if dist_to_teammate < 1.0: dynamic_risk = float('inf'); break
+                        dynamic_risk += self.risk_aversion / (dist_to_teammate ** 2)
 
-        max_time = 100  # A*搜索的最大时间步
+                    if static_risk == float('inf') or dynamic_risk == float('inf'):
+                        score = float('inf')
+                    else:
+                        score = bfs_dist + static_risk + dynamic_risk
 
-        while open_set:
-            _, current = heapq.heappop(open_set)
-            time_step = g_score[current]
+                if score < min_score:
+                    min_score, best_move_idx = score, move_idx
 
-            if current == goal:
-                path = []
-                while current in came_from:
-                    path.append(current)
-                    current = came_from[current]
-                return path[::-1]
+            best_individual_actions[i] = best_move_idx
+            intended_next_positions[i] = current_positions[i] + self.single_drone_actions[best_move_idx]
 
-            if time_step > max_time: continue
+        return self._env._encode_action(best_individual_actions)
 
-            for move in self.single_drone_actions:
-                neighbor = tuple(np.array(current) + move)
-
-                # 边界和静态障碍物检查
-                if not (0 <= neighbor[0] < self.grid_size[0] and 0 <= neighbor[1] < self.grid_size[1] and 0 <= neighbor[
-                    2] < self.grid_size[2]): continue
-                if self._env.obstacles[neighbor]: continue
-
-                # 动态障碍物检查（与其他无人机的路径碰撞）
-                is_collision = False
-                next_time_step = time_step + 1
-                for path in other_paths:
-                    # 检查未来位置是否与另一条路径在同一时间点重合
-                    if next_time_step < len(path) and neighbor == path[next_time_step]:
-                        is_collision = True
-                        break
-                    # 检查是否会发生“擦肩而过”的碰撞
-                    if next_time_step < len(path) and current == path[next_time_step] and neighbor == path[time_step]:
-                        is_collision = True
-                        break
-                if is_collision: continue
-
-                tentative_g_score = g_score[current] + 1
-                if tentative_g_score < g_score.get(neighbor, float('inf')):
-                    came_from[neighbor] = current
-                    g_score[neighbor] = tentative_g_score
-                    f_score = tentative_g_score + heuristic_map[neighbor]
-                    heapq.heappush(open_set, (f_score, neighbor))
-
-        return None  # 未找到路径
+    def _fast_heuristic_rollout(self, state: np.ndarray) -> float:
+        total_reward, current_state, discount = 0.0, state, 1.0
+        for _ in range(self.rollout_depth):
+            action = self._get_risk_aware_greedy_action(current_state)
+            next_state, reward, done, _ = self._env.simulate(current_state, action)
+            total_reward += discount * reward
+            discount *= self._env.get_config().discount_factor
+            current_state = next_state
+            if done: break
+        return total_reward

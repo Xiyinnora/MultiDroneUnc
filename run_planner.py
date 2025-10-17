@@ -1,49 +1,72 @@
+#!/usr/bin/env python3
+"""
+Run planner for MultiDroneUnc environment.
+
+Now supports default config (example_config.yaml) and MCTSPlanner with
+Manhattan-distance greedy rollout.
+
+Usage:
+    python run_planner.py
+or
+    python run_planner.py --config example_config.yaml
+"""
+
 import argparse
+import time
+import yaml
+import numpy as np
 from multi_drone import MultiDroneUnc
+from mcts_planner import MCTSPlanner
 
-# Replace this with your own online planner
-from dummy_planner import DummyPlanner
+def main():
+    # -------- argument parser --------
+    parser = argparse.ArgumentParser(description="Run MCTS planner for MultiDroneUnc environment")
+    parser.add_argument("--config", default="example_config.yaml", help="Path to configuration YAML file")
+    parser.add_argument("--time", type=float, default=1.0, help="Planning time per step (seconds)")
+    parser.add_argument("--rollout", choices=["random", "greedy"], default="greedy",
+                        help="Rollout type for MCTS (random or Manhattan greedy)")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
+    args = parser.parse_args()
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--config', type=str, required=True, help="Path to the yaml configuration file")
-args = parser.parse_args()
+    # -------- instantiate environment using the path string --------
+    env = MultiDroneUnc(args.config)
 
-def run(env, planner, planning_time_per_step=1.0):
-    # Set the simulator to the initial state
-    current_state = env.reset()
-    num_steps = 0
+    # -------- instantiate MCTS planner --------
+    planner = MCTSPlanner(
+        env,
+        c=1.0,
+        rollout_depth=30,
+        rng_seed=args.seed,
+        rollout_mode=args.rollout
+    )
+
+    # -------- run episode --------
+    state = env.reset()
     total_discounted_reward = 0.0
-    history = []
+    gamma = env.get_config().discount_factor
+    step = 0
+
+    print(f"\n[INFO] Starting planning run with config={args.config}, rollout={args.rollout}, "
+          f"planning_time={args.time}s per step\n")
 
     while True:
-        # Use MCTS to plan an action from the current state
-        action = planner.plan(current_state, planning_time_per_step)
+        # select action via MCTS
+        action = planner.plan(state, planning_time_per_step=args.time)
 
-        # Apply the action to the environment
-        next_state, reward, done, info = env.step(action)        
+        # apply to environment
+        next_state, reward, done, info = env.step(action)
 
-        # Accumulate discounted reward
-        total_discounted_reward += (env.get_config().discount_factor ** num_steps) * reward
+        total_discounted_reward += (gamma ** step) * reward
+        state = next_state
+        step += 1
 
-        # Log trajectory
-        history.append((current_state, action, reward, next_state, done, info))
+        print(f"Step {step:03d} | reward={reward:.2f} | total discounted={total_discounted_reward:.2f}")
 
-        # Move forward
-        current_state = next_state
-        num_steps += 1
-
-        if done or num_steps >= env.get_config().max_num_steps:
+        if done:
+            print("\n[INFO] Episode finished.")
             break
 
-    return total_discounted_reward, history
+    print(f"\n[RESULT] Total discounted reward after {step} steps: {total_discounted_reward:.3f}")
 
-# Instantiate the environment with the given config
-env = MultiDroneUnc(args.config)
-
-# Instantiate the planner
-planner = DummyPlanner(env, a_param=1.0, b_param=2)
-
-# Run the planning loop
-total_discounted_reward, history = run(env, planner, planning_time_per_step=1.0)
-print(f"success: {history[-1][5]['success']}, Total discounted reward: {total_discounted_reward}")
-env.show()
+if __name__ == "__main__":
+    main()
